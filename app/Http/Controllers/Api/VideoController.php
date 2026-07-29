@@ -24,7 +24,7 @@ class VideoController extends Controller
                     'key' => $apiKey,
                     'part' => 'snippet',
                     'q' => $query,
-                    'maxResults' => 12,
+                    'maxResults' => 30,
                     'type' => 'video'
                 ]);
 
