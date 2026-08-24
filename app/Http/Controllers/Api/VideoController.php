@@ -11,20 +11,12 @@ class VideoController extends Controller
 {
     private $baseUrl = 'https://www.googleapis.com/youtube/v3';
 
-    /**
-     * Get the array of API keys configured in services.php
-     */
     private function getApiKeys(): array
     {
         $keys = config('services.youtube.keys', []);
-
-        // Filter out any empty values
         return array_filter(array_map('trim', $keys));
     }
 
-    /**
-     * Executes a GET request against the YouTube API, rotating keys if quota is exceeded.
-     */
     private function executeRequestWithKeyRotation(string $endpoint, array $params = [])
     {
         $apiKeys = $this->getApiKeys();
@@ -41,25 +33,21 @@ class VideoController extends Controller
                 $response = Http::timeout(3)
                     ->get("{$this->baseUrl}/{$endpoint}", $requestParams);
 
-                // If the request is successful, return the response data
                 if ($response->successful()) {
                     return $response->json();
                 }
 
-                // YouTube returns HTTP 403 when quota is exceeded
                 if ($response->status() === 403) {
-                    Log::warning("YouTube API Key index [{$index}] quota exceeded or forbidden. Trying next key...");
-                    continue; // Move to the next key
+                    Log::warning("YouTube API Key index [{$index}] quota exceeded. Rotating...");
+                    continue;
                 }
 
-                // If other client/server error occurs, log and try next key
                 Log::warning("YouTube API returned status {$response->status()} for key index [{$index}].");
             } catch (\Exception $e) {
                 Log::warning("YouTube API request failed on key index [{$index}]: " . $e->getMessage());
             }
         }
 
-        // All keys failed or timed out
         return null;
     }
 
@@ -67,19 +55,38 @@ class VideoController extends Controller
     {
         $query = $request->query('q', 'trending');
 
-        $data = $this->executeRequestWithKeyRotation('search', [
+        // Step 1: Perform Search
+        $searchData = $this->executeRequestWithKeyRotation('search', [
             'part' => 'snippet',
             'q' => $query,
             'maxResults' => 30,
             'type' => 'video'
         ]);
 
-        if ($data !== null) {
-            return response()->json($data);
+        if ($searchData !== null && !empty($searchData['items'])) {
+            // Collect video IDs from search results
+            $videoIds = collect($searchData['items'])
+                ->map(function ($item) {
+                    return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
+                })
+                ->filter()
+                ->implode(',');
+
+            // Step 2: Fetch detailed statistics (viewCount, likes, etc.)
+            if (!empty($videoIds)) {
+                $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
+                    'part' => 'snippet,statistics',
+                    'id' => $videoIds
+                ]);
+
+                if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
+                    return response()->json($videosWithStats);
+                }
+            }
+
+            return response()->json($searchData);
         }
 
-        // Fallback to offline mock data if all keys fail or network issues persist
-        Log::warning('All YouTube API keys exhausted or network blocked. Falling back to offline mock data.');
         return response()->json($this->getMockSearchData($query));
     }
 
@@ -94,54 +101,59 @@ class VideoController extends Controller
             return response()->json($data);
         }
 
-        Log::warning('YouTube API Details failed across all keys. Falling back to offline mock data.');
         return response()->json($this->getMockVideoDetails($id));
     }
 
-    /**
-     * Offline mock data for Search
-     */
     private function getMockSearchData($query)
     {
         return [
             'items' => [
                 [
-                    'id' => ['videoId' => 'dQw4w9WgXcQ'],
+                    'id' => 'dQw4w9WgXcQ',
                     'snippet' => [
                         'title' => "Offline Mode: Vue 3 Basics (Search: {$query})",
                         'channelTitle' => 'Frontend Academy',
+                        'publishedAt' => '2023-11-10T12:00:00Z',
                         'thumbnails' => [
                             'medium' => ['url' => 'https://picsum.photos/id/1/320/180']
                         ]
+                    ],
+                    'statistics' => [
+                        'viewCount' => '1420500'
                     ]
                 ],
                 [
-                    'id' => ['videoId' => 'bMknfKXIFA8'],
+                    'id' => 'bMknfKXIFA8',
                     'snippet' => [
-                        'title' => "Offline Mode: Laravel 9 Controllers (Search: {$query})",
+                        'title' => "Offline Mode: Laravel 10 Controllers (Search: {$query})",
                         'channelTitle' => 'Backend Casts',
+                        'publishedAt' => '2024-01-15T09:30:00Z',
                         'thumbnails' => [
                             'medium' => ['url' => 'https://picsum.photos/id/2/320/180']
                         ]
+                    ],
+                    'statistics' => [
+                        'viewCount' => '85320'
                     ]
                 ],
                 [
-                    'id' => ['videoId' => '2g811Eo7K8U'],
+                    'id' => '2g811Eo7K8U',
                     'snippet' => [
-                        'title' => "Offline Mode: Deploying to Netlify (Search: {$query})",
+                        'title' => "Offline Mode: Deploying Applications (Search: {$query})",
                         'channelTitle' => 'Deployment Tips',
+                        'publishedAt' => '2024-02-20T18:00:00Z',
                         'thumbnails' => [
                             'medium' => ['url' => 'https://picsum.photos/id/3/320/180']
                         ]
+                    ],
+                    'statistics' => [
+                        'viewCount' => '12400'
                     ]
                 ]
             ]
         ];
     }
 
-    /**
-     * Offline mock data for Video Details
-     */
     private function getMockVideoDetails($id)
     {
         return [
@@ -151,7 +163,12 @@ class VideoController extends Controller
                     'snippet' => [
                         'title' => 'Offline Mode: Sample Video Details',
                         'channelTitle' => 'Local Development Server',
-                        'description' => "This is a local simulation.\n\nYour network or API keys are unavailable. This automatic fallback lets you continue building and testing your user interface without interruption."
+                        'publishedAt' => '2024-01-01T00:00:00Z',
+                        'description' => "This is a local simulation fallback."
+                    ],
+                    'statistics' => [
+                        'viewCount' => '2500000',
+                        'likeCount' => '120000'
                     ]
                 ]
             ]
