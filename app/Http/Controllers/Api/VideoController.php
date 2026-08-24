@@ -75,7 +75,7 @@ class VideoController extends Controller
             // Step 2: Fetch detailed statistics (viewCount, likes, etc.)
             if (!empty($videoIds)) {
                 $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
-                    'part' => 'snippet,statistics',
+                    'part' => 'snippet,statistics,contentDetails',
                     'id' => $videoIds
                 ]);
 
@@ -93,7 +93,7 @@ class VideoController extends Controller
     public function show($id)
     {
         $data = $this->executeRequestWithKeyRotation('videos', [
-            'part' => 'snippet,statistics',
+            'part' => 'snippet,statistics,contentDetails',
             'id' => $id
         ]);
 
