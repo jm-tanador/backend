@@ -11,56 +11,90 @@ class VideoController extends Controller
 {
     private $baseUrl = 'https://www.googleapis.com/youtube/v3';
 
-    public function search(Request $request)
+    /**
+     * Get the array of API keys configured in services.php
+     */
+    private function getApiKeys(): array
     {
-        $query = $request->query('q', 'programming');
-        $apiKey = env('YOUTUBE_API_KEY');
+        $keys = config('services.youtube.keys', []);
 
-        try {
-            // Try contacting Google, but limit waiting to 3 seconds
-            $response = Http::withoutVerifying()
-                ->timeout(3) 
-                ->get("{$this->baseUrl}/search", [
-                    'key' => $apiKey,
-                    'part' => 'snippet',
-                    'q' => $query,
-                    'maxResults' => 30,
-                    'type' => 'video'
-                ]);
+        // Filter out any empty values
+        return array_filter(array_map('trim', $keys));
+    }
 
-            if ($response->successful()) {
-                return response()->json($response->json());
-            }
-        } catch (\Exception $e) {
-            // Log the error silently in storage/logs/laravel.log
-            Log::warning('YouTube API blocked. Falling back to offline mock data: ' . $e->getMessage());
+    /**
+     * Executes a GET request against the YouTube API, rotating keys if quota is exceeded.
+     */
+    private function executeRequestWithKeyRotation(string $endpoint, array $params = [])
+    {
+        $apiKeys = $this->getApiKeys();
+
+        if (empty($apiKeys)) {
+            Log::warning('No YouTube API keys configured.');
+            return null;
         }
 
-        // Return offline mock data if the API call fails or times out
+        foreach ($apiKeys as $index => $apiKey) {
+            try {
+                $requestParams = array_merge($params, ['key' => $apiKey]);
+
+                $response = Http::timeout(3)
+                    ->get("{$this->baseUrl}/{$endpoint}", $requestParams);
+
+                // If the request is successful, return the response data
+                if ($response->successful()) {
+                    return $response->json();
+                }
+
+                // YouTube returns HTTP 403 when quota is exceeded
+                if ($response->status() === 403) {
+                    Log::warning("YouTube API Key index [{$index}] quota exceeded or forbidden. Trying next key...");
+                    continue; // Move to the next key
+                }
+
+                // If other client/server error occurs, log and try next key
+                Log::warning("YouTube API returned status {$response->status()} for key index [{$index}].");
+            } catch (\Exception $e) {
+                Log::warning("YouTube API request failed on key index [{$index}]: " . $e->getMessage());
+            }
+        }
+
+        // All keys failed or timed out
+        return null;
+    }
+
+    public function search(Request $request)
+    {
+        $query = $request->query('q', 'trending');
+
+        $data = $this->executeRequestWithKeyRotation('search', [
+            'part' => 'snippet',
+            'q' => $query,
+            'maxResults' => 30,
+            'type' => 'video'
+        ]);
+
+        if ($data !== null) {
+            return response()->json($data);
+        }
+
+        // Fallback to offline mock data if all keys fail or network issues persist
+        Log::warning('All YouTube API keys exhausted or network blocked. Falling back to offline mock data.');
         return response()->json($this->getMockSearchData($query));
     }
 
     public function show($id)
     {
-        $apiKey = env('YOUTUBE_API_KEY');
+        $data = $this->executeRequestWithKeyRotation('videos', [
+            'part' => 'snippet,statistics',
+            'id' => $id
+        ]);
 
-        try {
-            // Try contacting Google, but limit waiting to 3 seconds
-            $response = Http::withoutVerifying()
-                ->timeout(3)
-                ->get("{$this->baseUrl}/videos", [
-                    'key' => $apiKey,
-                    'part' => 'snippet,statistics',
-                    'id' => $id
-                ]);
-
-            if ($response->successful()) {
-                return response()->json($response->json());
-            }
-        } catch (\Exception $e) {
-            Log::warning('YouTube API Details blocked. Falling back to offline mock data: ' . $e->getMessage());
+        if ($data !== null) {
+            return response()->json($data);
         }
 
+        Log::warning('YouTube API Details failed across all keys. Falling back to offline mock data.');
         return response()->json($this->getMockVideoDetails($id));
     }
 
@@ -117,7 +151,7 @@ class VideoController extends Controller
                     'snippet' => [
                         'title' => 'Offline Mode: Sample Video Details',
                         'channelTitle' => 'Local Development Server',
-                        'description' => "This is a local simulation.\n\nYour network is blocking connection requests to Google (timeout error 28). This automatic fallback lets you continue building and testing your user interface without interruption."
+                        'description' => "This is a local simulation.\n\nYour network or API keys are unavailable. This automatic fallback lets you continue building and testing your user interface without interruption."
                     ]
                 ]
             ]
