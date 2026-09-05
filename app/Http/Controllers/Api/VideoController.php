@@ -55,7 +55,7 @@ class VideoController extends Controller
     {
         $query = $request->query('q', 'trending');
 
-        // Step 1: Perform Search
+        // Step 1: Search videos (this already queries both regular videos and live broadcasts)
         $searchData = $this->executeRequestWithKeyRotation('search', [
             'part' => 'snippet',
             'q' => $query,
@@ -64,7 +64,6 @@ class VideoController extends Controller
         ]);
 
         if ($searchData !== null && !empty($searchData['items'])) {
-            // Collect video IDs from search results
             $videoIds = collect($searchData['items'])
                 ->map(function ($item) {
                     return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
@@ -72,10 +71,10 @@ class VideoController extends Controller
                 ->filter()
                 ->implode(',');
 
-            // Step 2: Fetch detailed statistics (viewCount, likes, etc.)
+            // Step 2: Include 'liveStreamingDetails' alongside snippet, statistics, contentDetails
             if (!empty($videoIds)) {
                 $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
-                    'part' => 'snippet,statistics,contentDetails',
+                    'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
                     'id' => $videoIds
                 ]);
 
