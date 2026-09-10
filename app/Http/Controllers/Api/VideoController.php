@@ -108,84 +108,87 @@ class VideoController extends Controller
         $user = $request->user();
         $accessToken = $user->google_token;
 
-        // If the user has no Google access token, fallback to trending
         if (!$accessToken) {
+            return response()->json([
+                'debug_error' => 'No access token found in database for user',
+                'items' => []
+            ], 400);
+        }
+
+        // 1. Check subscriptions from Google API
+        $subResponse = Http::timeout(5)
+            ->withToken($accessToken)
+            ->get("https://www.googleapis.com/youtube/v3/subscriptions", [
+                'part' => 'snippet',
+                'mine' => 'true',
+                'maxResults' => 15
+            ]);
+
+        // IF GOOGLE REJECTS THE REQUEST (e.g., token expired or scope missing):
+        if (!$subResponse->successful()) {
+            return response()->json([
+                'debug_error' => 'Google YouTube API rejected the token',
+                'google_status' => $subResponse->status(),
+                'google_response' => $subResponse->json(),
+            ], 400);
+        }
+
+        $items = $subResponse->json()['items'] ?? [];
+        $channelIds = collect($items)
+            ->pluck('snippet.resourceId.channelId')
+            ->filter();
+
+        // IF YOU HAVE 0 SUBSCRIPTIONS ON THIS GOOGLE ACCOUNT:
+        if ($channelIds->isEmpty()) {
+            return response()->json([
+                'debug_error' => 'User has 0 YouTube subscriptions on this Google account',
+                'items' => []
+            ]);
+        }
+
+        // 2. Fetch videos from subscribed channels
+        $rawVideos = [];
+        foreach ($channelIds->take(5) as $channelId) {
+            $searchData = $this->executeRequestWithKeyRotation('search', [
+                'part' => 'snippet',
+                'channelId' => $channelId,
+                'order' => 'date',
+                'maxResults' => 4,
+                'type' => 'video'
+            ]);
+
+            if ($searchData !== null && !empty($searchData['items'])) {
+                $rawVideos = array_merge($rawVideos, $searchData['items']);
+            }
+        }
+
+        if (empty($rawVideos)) {
             return $this->search($request);
         }
 
-        try {
-            // 1. Fetch channels the logged-in user is subscribed to
-            $subResponse = Http::timeout(5)
-                ->withToken($accessToken)
-                ->get("{$this->baseUrl}/subscriptions", [
-                    'part' => 'snippet',
-                    'mine' => 'true',
-                    'maxResults' => 15
-                ]);
+        // 3. Enrich videos with stats
+        $videoIds = collect($rawVideos)
+            ->map(function ($item) {
+                return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
+            })
+            ->filter()
+            ->implode(',');
 
-            if (!$subResponse->successful()) {
-                // If token expired or failed, fallback to regular trending search
-                return $this->search($request);
+        if (!empty($videoIds)) {
+            $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
+                'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
+                'id' => $videoIds
+            ]);
+
+            if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
+                $feedItems = $videosWithStats['items'];
+                shuffle($feedItems);
+                return response()->json(['items' => $feedItems]);
             }
-
-            $items = $subResponse->json()['items'] ?? [];
-            $channelIds = collect($items)
-                ->pluck('snippet.resourceId.channelId')
-                ->filter();
-
-            // If user has no subscriptions, fallback to trending
-            if ($channelIds->isEmpty()) {
-                return $this->search($request);
-            }
-
-            // 2. Fetch the latest videos from up to 6 of their subscribed channels
-            $rawVideos = [];
-            foreach ($channelIds->take(6) as $channelId) {
-                $searchData = $this->executeRequestWithKeyRotation('search', [
-                    'part' => 'snippet',
-                    'channelId' => $channelId,
-                    'order' => 'date',
-                    'maxResults' => 4,
-                    'type' => 'video'
-                ]);
-
-                if ($searchData !== null && !empty($searchData['items'])) {
-                    $rawVideos = array_merge($rawVideos, $searchData['items']);
-                }
-            }
-
-            if (empty($rawVideos)) {
-                return $this->search($request);
-            }
-
-            // 3. Enrich the videos with view counts, duration, and live badges
-            $videoIds = collect($rawVideos)
-                ->map(function ($item) {
-                    return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
-                })
-                ->filter()
-                ->implode(',');
-
-            if (!empty($videoIds)) {
-                $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
-                    'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
-                    'id' => $videoIds
-                ]);
-
-                if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
-                    $feedItems = $videosWithStats['items'];
-                    shuffle($feedItems); // Shuffle so it blends into a diverse feed
-                    return response()->json(['items' => $feedItems]);
-                }
-            }
-
-            shuffle($rawVideos);
-            return response()->json(['items' => $rawVideos]);
-
-        } catch (\Exception $e) {
-            Log::error('Error generating personalized feed: ' . $e->getMessage());
-            return $this->search($request);
         }
+
+        shuffle($rawVideos);
+        return response()->json(['items' => $rawVideos]);
     }
 
     private function getMockSearchData($query)
