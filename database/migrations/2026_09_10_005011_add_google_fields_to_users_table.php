@@ -3,14 +3,10 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB; // <-- make sure DB is imported
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     *
-     * @return void
-     */
     public function up()
     {
         Schema::table('users', function (Blueprint $table) {
@@ -18,9 +14,10 @@ return new class extends Migration
             $table->string('avatar')->nullable();
             $table->text('google_token')->nullable();
             $table->text('google_refresh_token')->nullable();
-            // Make password nullable since Google users won't have one
-            $table->string('password')->nullable()->change();
         });
+
+        // PostgreSQL command to make password optional without doctrine/dbal:
+        DB::statement('ALTER TABLE users ALTER COLUMN password DROP NOT NULL;');
     }
 
     public function down()
@@ -28,5 +25,7 @@ return new class extends Migration
         Schema::table('users', function (Blueprint $table) {
             $table->dropColumn(['google_id', 'avatar', 'google_token', 'google_refresh_token']);
         });
+
+        DB::statement('ALTER TABLE users ALTER COLUMN password SET NOT NULL;');
     }
 };
