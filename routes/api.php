@@ -25,6 +25,17 @@ Route::get('/search', [VideoController::class, 'search']);
 Route::get('/videos/{id}', [VideoController::class, 'show']);
 Route::get('/auth/google', [GoogleAuthController::class, 'redirectToGoogle']);
 Route::get('/auth/google/callback', [GoogleAuthController::class, 'handleGoogleCallback']);
+
+Route::middleware('auth:sanctum')->group(function () {
+
+    // IMPORTANT: It must be '/me', NOT '/api/me'
+    Route::get('/me', function (Request $request) {
+        return response()->json($request->user());
+    });
+
+    // Personalized feed based on subscriptions
+    Route::get('/feed/personalized', [VideoController::class, 'personalizedFeed']);
+});
 // Route::get('/run-migrations', function () {
 //     try {
 //         Artisan::call('migrate', ['--force' => true]);
