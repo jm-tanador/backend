@@ -109,13 +109,10 @@ class VideoController extends Controller
         $accessToken = $user->google_token;
 
         if (!$accessToken) {
-            return response()->json([
-                'debug_error' => 'No access token found in database for user',
-                'items' => []
-            ], 400);
+            return response()->json(['debug_error' => 'No access token for user', 'items' => []], 400);
         }
 
-        // 1. Check subscriptions from Google API
+        // 1. Attempt to fetch user's subscriptions
         $subResponse = Http::timeout(5)
             ->withToken($accessToken)
             ->get("https://www.googleapis.com/youtube/v3/subscriptions", [
@@ -124,10 +121,37 @@ class VideoController extends Controller
                 'maxResults' => 15
             ]);
 
-        // IF GOOGLE REJECTS THE REQUEST (e.g., token expired or scope missing):
+        // 2. TOKEN EXPIRED (401)? Auto-refresh it using google_refresh_token!
+        if ($subResponse->status() === 401 && $user->google_refresh_token) {
+            $refreshResponse = Http::asForm()->post('https://oauth2.googleapis.com/token', [
+                'client_id' => config('services.google.client_id'),
+                'client_secret' => config('services.google.client_secret'),
+                'refresh_token' => $user->google_refresh_token,
+                'grant_type' => 'refresh_token',
+            ]);
+
+            if ($refreshResponse->successful()) {
+                $newTokens = $refreshResponse->json();
+                $accessToken = $newTokens['access_token'];
+
+                // Save fresh token to database
+                $user->update(['google_token' => $accessToken]);
+
+                // Retry request with the new fresh token
+                $subResponse = Http::timeout(5)
+                    ->withToken($accessToken)
+                    ->get("https://www.googleapis.com/youtube/v3/subscriptions", [
+                        'part' => 'snippet',
+                        'mine' => 'true',
+                        'maxResults' => 15
+                    ]);
+            }
+        }
+
+        // If it still fails after refreshing
         if (!$subResponse->successful()) {
             return response()->json([
-                'debug_error' => 'Google YouTube API rejected the token',
+                'debug_error' => 'Google YouTube API rejected the token even after refresh attempt',
                 'google_status' => $subResponse->status(),
                 'google_response' => $subResponse->json(),
             ], 400);
@@ -138,15 +162,12 @@ class VideoController extends Controller
             ->pluck('snippet.resourceId.channelId')
             ->filter();
 
-        // IF YOU HAVE 0 SUBSCRIPTIONS ON THIS GOOGLE ACCOUNT:
+        // If user has 0 subscriptions, fallback to trending
         if ($channelIds->isEmpty()) {
-            return response()->json([
-                'debug_error' => 'User has 0 YouTube subscriptions on this Google account',
-                'items' => []
-            ]);
+            return $this->search($request);
         }
 
-        // 2. Fetch videos from subscribed channels
+        // 3. Fetch latest videos from subscribed channels
         $rawVideos = [];
         foreach ($channelIds->take(5) as $channelId) {
             $searchData = $this->executeRequestWithKeyRotation('search', [
@@ -166,7 +187,7 @@ class VideoController extends Controller
             return $this->search($request);
         }
 
-        // 3. Enrich videos with stats
+        // 4. Enrich videos with view counts, duration, and live badges
         $videoIds = collect($rawVideos)
             ->map(function ($item) {
                 return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
