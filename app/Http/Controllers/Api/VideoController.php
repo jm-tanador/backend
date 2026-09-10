@@ -103,6 +103,91 @@ class VideoController extends Controller
         return response()->json($this->getMockVideoDetails($id));
     }
 
+    public function personalizedFeed(Request $request)
+    {
+        $user = $request->user();
+        $accessToken = $user->google_token;
+
+        // If the user has no Google access token, fallback to trending
+        if (!$accessToken) {
+            return $this->search($request);
+        }
+
+        try {
+            // 1. Fetch channels the logged-in user is subscribed to
+            $subResponse = Http::timeout(5)
+                ->withToken($accessToken)
+                ->get("{$this->baseUrl}/subscriptions", [
+                    'part' => 'snippet',
+                    'mine' => 'true',
+                    'maxResults' => 15
+                ]);
+
+            if (!$subResponse->successful()) {
+                // If token expired or failed, fallback to regular trending search
+                return $this->search($request);
+            }
+
+            $items = $subResponse->json()['items'] ?? [];
+            $channelIds = collect($items)
+                ->pluck('snippet.resourceId.channelId')
+                ->filter();
+
+            // If user has no subscriptions, fallback to trending
+            if ($channelIds->isEmpty()) {
+                return $this->search($request);
+            }
+
+            // 2. Fetch the latest videos from up to 6 of their subscribed channels
+            $rawVideos = [];
+            foreach ($channelIds->take(6) as $channelId) {
+                $searchData = $this->executeRequestWithKeyRotation('search', [
+                    'part' => 'snippet',
+                    'channelId' => $channelId,
+                    'order' => 'date',
+                    'maxResults' => 4,
+                    'type' => 'video'
+                ]);
+
+                if ($searchData !== null && !empty($searchData['items'])) {
+                    $rawVideos = array_merge($rawVideos, $searchData['items']);
+                }
+            }
+
+            if (empty($rawVideos)) {
+                return $this->search($request);
+            }
+
+            // 3. Enrich the videos with view counts, duration, and live badges
+            $videoIds = collect($rawVideos)
+                ->map(function ($item) {
+                    return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
+                })
+                ->filter()
+                ->implode(',');
+
+            if (!empty($videoIds)) {
+                $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
+                    'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
+                    'id' => $videoIds
+                ]);
+
+                if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
+                    $feedItems = $videosWithStats['items'];
+                    shuffle($feedItems); // Shuffle so it blends into a diverse feed
+                    return response()->json(['items' => $feedItems]);
+                }
+            }
+
+            shuffle($rawVideos);
+            return response()->json(['items' => $rawVideos]);
+
+        } catch (\Exception $e) {
+            Log::error('Error generating personalized feed: ' . $e->getMessage());
+            return $this->search($request);
+        }
+    }
+
     private function getMockSearchData($query)
     {
         return [
