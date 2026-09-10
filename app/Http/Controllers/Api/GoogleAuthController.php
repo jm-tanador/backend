@@ -57,12 +57,12 @@ public function handleGoogleCallback(Request $request)
 
     $googleUser = $userResponse->json();
 
-    // Save or update user
+    // Save or update user (find by email)
     $user = User::updateOrCreate([
-        'google_id' => $googleUser['sub'],
+        'email' => $googleUser['email'], // <-- Search by email to prevent duplicate constraint errors
     ], [
         'name' => $googleUser['name'] ?? '',
-        'email' => $googleUser['email'] ?? '',
+        'google_id' => $googleUser['sub'] ?? null,
         'avatar' => $googleUser['picture'] ?? '',
         'google_token' => $accessToken,
         'google_refresh_token' => $tokens['refresh_token'] ?? null,
