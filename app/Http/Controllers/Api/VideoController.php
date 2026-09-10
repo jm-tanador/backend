@@ -59,7 +59,7 @@ class VideoController extends Controller
         $searchData = $this->executeRequestWithKeyRotation('search', [
             'part' => 'snippet',
             'q' => $query,
-            'maxResults' => 30,
+            'maxResults' => 100,
             'type' => 'video'
         ]);
 
