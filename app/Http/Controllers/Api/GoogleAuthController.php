@@ -16,7 +16,8 @@ class GoogleAuthController extends Controller
             'client_id' => config('services.google.client_id'),
             'redirect_uri' => config('services.google.redirect_uri'),
             'response_type' => 'code',
-            'scope' => 'openid profile email https://www.googleapis.com/auth/youtube.readonly',
+            // 'scope' => 'openid profile email https://www.googleapis.com/auth/youtube.readonly',
+            'scope' => 'openid profile email',
             'access_type' => 'offline',
             'prompt' => 'consent',
         ]);
