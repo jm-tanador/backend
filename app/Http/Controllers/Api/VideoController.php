@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use App\Models\WatchHistory;
 
 class VideoController extends Controller
 {
@@ -106,110 +108,111 @@ class VideoController extends Controller
     public function personalizedFeed(Request $request)
     {
         $user = $request->user();
-        $accessToken = $user->google_token;
 
-        if (!$accessToken) {
-            return response()->json(['debug_error' => 'No access token for user', 'items' => []], 400);
-        }
+        // YouTube search costs 100 quota units per call, so cache each user's feed
+        $items = Cache::remember("feed:{$user->id}", now()->addMinutes(30), function () use ($user) {
+            $history = WatchHistory::where('user_id', $user->id)
+                ->orderByDesc('watched_at')
+                ->limit(30)
+                ->get();
 
-        // 1. Attempt to fetch user's subscriptions
-        $subResponse = Http::timeout(5)
-            ->withToken($accessToken)
-            ->get("https://www.googleapis.com/youtube/v3/subscriptions", [
-                'part' => 'snippet',
-                'mine' => 'true',
-                'maxResults' => 15
-            ]);
-
-        // 2. TOKEN EXPIRED (401)? Auto-refresh it using google_refresh_token!
-        if ($subResponse->status() === 401 && $user->google_refresh_token) {
-            $refreshResponse = Http::asForm()->post('https://oauth2.googleapis.com/token', [
-                'client_id' => config('services.google.client_id'),
-                'client_secret' => config('services.google.client_secret'),
-                'refresh_token' => $user->google_refresh_token,
-                'grant_type' => 'refresh_token',
-            ]);
-
-            if ($refreshResponse->successful()) {
-                $newTokens = $refreshResponse->json();
-                $accessToken = $newTokens['access_token'];
-
-                // Save fresh token to database
-                $user->update(['google_token' => $accessToken]);
-
-                // Retry request with the new fresh token
-                $subResponse = Http::timeout(5)
-                    ->withToken($accessToken)
-                    ->get("https://www.googleapis.com/youtube/v3/subscriptions", [
-                        'part' => 'snippet',
-                        'mine' => 'true',
-                        'maxResults' => 15
-                    ]);
+            if ($history->isEmpty()) {
+                return null;
             }
-        }
 
-        // If it still fails after refreshing
-        if (!$subResponse->successful()) {
-            return response()->json([
-                'debug_error' => 'Google YouTube API rejected the token even after refresh attempt',
-                'google_status' => $subResponse->status(),
-                'google_response' => $subResponse->json(),
-            ], 400);
-        }
+            $rawVideos = [];
 
-        $items = $subResponse->json()['items'] ?? [];
-        $channelIds = collect($items)
-            ->pluck('snippet.resourceId.channelId')
-            ->filter();
+            // Latest videos from the 3 channels they watch most
+            $topChannels = $history->whereNotNull('channel_id')
+                ->groupBy('channel_id')
+                ->sortByDesc(fn ($g) => $g->count())
+                ->keys()
+                ->take(3);
 
-        // If user has 0 subscriptions, fallback to trending
-        if ($channelIds->isEmpty()) {
-            return $this->search($request);
-        }
-
-        // 3. Fetch latest videos from subscribed channels
-        $rawVideos = [];
-        foreach ($channelIds->take(5) as $channelId) {
-            $searchData = $this->executeRequestWithKeyRotation('search', [
-                'part' => 'snippet',
-                'channelId' => $channelId,
-                'order' => 'date',
-                'maxResults' => 4,
-                'type' => 'video'
-            ]);
-
-            if ($searchData !== null && !empty($searchData['items'])) {
-                $rawVideos = array_merge($rawVideos, $searchData['items']);
+            foreach ($topChannels as $channelId) {
+                $data = $this->executeRequestWithKeyRotation('search', [
+                    'part'       => 'snippet',
+                    'channelId'  => $channelId,
+                    'order'      => 'date',
+                    'maxResults' => 8,
+                    'type'       => 'video',
+                ]);
+                if (!empty($data['items'])) {
+                    $rawVideos = array_merge($rawVideos, $data['items']);
+                }
             }
-        }
 
-        if (empty($rawVideos)) {
-            return $this->search($request);
-        }
+            // Videos similar to the most recently watched one
+            $recentTitle = $history->first()->title;
+            if ($recentTitle) {
+                $data = $this->executeRequestWithKeyRotation('search', [
+                    'part'       => 'snippet',
+                    'q'          => $recentTitle,
+                    'maxResults' => 10,
+                    'type'       => 'video',
+                ]);
+                if (!empty($data['items'])) {
+                    $rawVideos = array_merge($rawVideos, $data['items']);
+                }
+            }
 
-        // 4. Enrich videos with view counts, duration, and live badges
-        $videoIds = collect($rawVideos)
-            ->map(function ($item) {
-                return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
-            })
-            ->filter()
-            ->implode(',');
+            // Skip videos they've already watched
+            $watched = $history->pluck('video_id')->all();
+            $videoIds = collect($rawVideos)
+                ->map(fn ($i) => is_array($i['id']) ? ($i['id']['videoId'] ?? null) : $i['id'])
+                ->filter()
+                ->unique()
+                ->reject(fn ($id) => in_array($id, $watched))
+                ->take(50)
+                ->implode(',');
 
-        if (!empty($videoIds)) {
-            $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
+            if (!$videoIds) {
+                return null;
+            }
+
+            $videos = $this->executeRequestWithKeyRotation('videos', [
                 'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
-                'id' => $videoIds
+                'id'   => $videoIds,
             ]);
 
-            if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
-                $feedItems = $videosWithStats['items'];
-                shuffle($feedItems);
-                return response()->json(['items' => $feedItems]);
-            }
+            $feed = $videos['items'] ?? [];
+            shuffle($feed);
+
+            return $feed ?: null;
+        });
+
+        // New user with no history yet (or API failure): show trending
+        if (empty($items)) {
+            return $this->search($request);
         }
 
-        shuffle($rawVideos);
-        return response()->json(['items' => $rawVideos]);
+        return response()->json(['items' => $items]);
+    }
+
+    public function recordWatch(Request $request)
+    {
+        $data = $request->validate([
+            'video_id'      => 'required|string|max:32',
+            'channel_id'    => 'nullable|string|max:64',
+            'channel_title' => 'nullable|string|max:255',
+            'title'         => 'nullable|string|max:255',
+        ]);
+
+        $userId = $request->user()->id;
+
+        WatchHistory::updateOrCreate(
+            ['user_id' => $userId, 'video_id' => $data['video_id']],
+            [
+                'channel_id'    => $data['channel_id'] ?? null,
+                'channel_title' => $data['channel_title'] ?? null,
+                'title'         => $data['title'] ?? null,
+                'watched_at'    => now(),
+            ]
+        );
+
+        Cache::forget("feed:{$userId}"); // so the next feed reflects this watch
+
+        return response()->json(['ok' => true]);
     }
 
     private function getMockSearchData($query)

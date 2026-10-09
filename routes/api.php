@@ -35,6 +35,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Personalized feed based on subscriptions
     Route::get('/feed/personalized', [VideoController::class, 'personalizedFeed']);
+    Route::post('/history', [VideoController::class, 'recordWatch']);
 });
 // Route::get('/run-migrations', function () {
 //     try {
