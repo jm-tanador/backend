@@ -53,42 +53,178 @@ class VideoController extends Controller
         return null;
     }
 
+    // Category filters for the home page chips.
+    // 'videoCategoryId' values are YouTube's standard category IDs.
+    private const CATEGORIES = [
+        'live'          => ['eventType' => 'live'],
+        // YouTube has no "Shorts" filter: search short videos with #shorts, then keep only clips <= 3 min
+        'shorts'        => ['videoDuration' => 'short', 'suffix' => '#shorts', 'maxSeconds' => 180],
+        'music'         => ['videoCategoryId' => '10'],
+        'gaming'        => ['videoCategoryId' => '20'],
+        'sports'        => ['videoCategoryId' => '17'],
+        'news'          => ['videoCategoryId' => '25'],
+        'entertainment' => ['videoCategoryId' => '24'],
+        'education'     => ['videoCategoryId' => '27'],
+        'tech'          => ['videoCategoryId' => '28'],
+        'comedy'        => ['videoCategoryId' => '23'],
+    ];
+
     public function search(Request $request)
     {
-        $query = $request->query('q', 'trending');
+        $query    = trim((string) $request->query('q', ''));
+        $category = strtolower((string) $request->query('category', 'all'));
+        $config   = self::CATEGORIES[$category] ?? null;
 
-        // Step 1: Search videos (this already queries both regular videos and live broadcasts)
-        $searchData = $this->executeRequestWithKeyRotation('search', [
-            'part' => 'snippet',
-            'q' => $query,
-            'maxResults' => 100,
-            'type' => 'video'
+        if ($config === null) {
+            $category = 'all';
+            if ($query === '') {
+                $query = 'trending';
+            }
+        }
+
+        // A search costs 100 YouTube quota units, so cache identical searches for a few minutes
+        $ttl  = $category === 'live' ? now()->addMinutes(3) : now()->addMinutes(10);
+        $data = Cache::remember('search:' . md5($category . '|' . $query), $ttl, function () use ($query, $config) {
+            return $this->fetchSearch($query, $config);
+        });
+
+        // null means the YouTube API failed on every key: fall back to the offline sample data
+        if ($data === null) {
+            return response()->json($this->getMockSearchData($query !== '' ? $query : $category));
+        }
+
+        return response()->json($data);
+    }
+
+    private function fetchSearch(string $query, ?array $config): ?array
+    {
+        $params = [
+            'part'       => 'snippet',
+            'maxResults' => 50,
+            'type'       => 'video',
+        ];
+
+        $q = $query;
+        if ($config) {
+            foreach (['eventType', 'videoDuration', 'videoCategoryId'] as $key) {
+                if (isset($config[$key])) {
+                    $params[$key] = $config[$key];
+                }
+            }
+            if (!empty($config['suffix'])) {
+                $q = trim($q . ' ' . $config['suffix']);
+            }
+        }
+        if ($q !== '') {
+            $params['q'] = $q;
+        }
+
+        // Step 1: search
+        $searchData = $this->executeRequestWithKeyRotation('search', $params);
+        if ($searchData === null) {
+            return null;
+        }
+        if (empty($searchData['items'])) {
+            return ['items' => []];
+        }
+
+        $videoIds = collect($searchData['items'])
+            ->map(fn ($item) => is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'])
+            ->filter()
+            ->implode(',');
+
+        if ($videoIds === '') {
+            return $searchData;
+        }
+
+        // Step 2: add statistics, duration and live details
+        $videos = $this->executeRequestWithKeyRotation('videos', [
+            'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
+            'id'   => $videoIds,
         ]);
 
-        if ($searchData !== null && !empty($searchData['items'])) {
-            $videoIds = collect($searchData['items'])
-                ->map(function ($item) {
-                    return is_array($item['id']) ? ($item['id']['videoId'] ?? null) : $item['id'];
-                })
+        if ($videos === null || empty($videos['items'])) {
+            return $searchData;
+        }
+
+        // Shorts: keep only clips that are really short
+        if (!empty($config['maxSeconds'])) {
+            $videos['items'] = array_values(array_filter($videos['items'], function ($v) use ($config) {
+                $seconds = $this->durationSeconds($v['contentDetails']['duration'] ?? '');
+                return $seconds > 0 && $seconds <= $config['maxSeconds'];
+            }));
+        }
+
+        return $videos;
+    }
+
+    // "PT1M5S" -> 65
+    private function durationSeconds(string $iso): int
+    {
+        if (!preg_match('/^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/', $iso, $m)) {
+            return 0;
+        }
+
+        return ((int) ($m[1] ?? 0)) * 86400
+            + ((int) ($m[2] ?? 0)) * 3600
+            + ((int) ($m[3] ?? 0)) * 60
+            + (int) ($m[4] ?? 0);
+    }
+
+    // Channel info (name, avatar, banner, subscribers...). 1 quota unit, cached 1 hour.
+    public function channel(string $id)
+    {
+        $data = Cache::remember("channel:{$id}", now()->addHour(), function () use ($id) {
+            return $this->executeRequestWithKeyRotation('channels', [
+                'part' => 'snippet,statistics,brandingSettings',
+                'id'   => $id,
+            ]);
+        });
+
+        if (empty($data['items'])) {
+            return response()->json(['message' => 'Channel not found'], 404);
+        }
+
+        return response()->json($data['items'][0]);
+    }
+
+    // Latest uploads of a channel. Uses the channel's "uploads" playlist (UC... -> UU...),
+    // which costs 1 quota unit instead of 100 for a search.
+    public function channelVideos(string $id)
+    {
+        $items = Cache::remember("channel-videos:{$id}", now()->addMinutes(10), function () use ($id) {
+            $playlist = $this->executeRequestWithKeyRotation('playlistItems', [
+                'part'       => 'contentDetails',
+                'playlistId' => 'UU' . substr($id, 2),
+                'maxResults' => 50,
+            ]);
+
+            if ($playlist === null) {
+                return null;
+            }
+
+            $ids = collect($playlist['items'] ?? [])
+                ->map(fn ($i) => $i['contentDetails']['videoId'] ?? null)
                 ->filter()
                 ->implode(',');
 
-            // Step 2: Include 'liveStreamingDetails' alongside snippet, statistics, contentDetails
-            if (!empty($videoIds)) {
-                $videosWithStats = $this->executeRequestWithKeyRotation('videos', [
-                    'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
-                    'id' => $videoIds
-                ]);
-
-                if ($videosWithStats !== null && !empty($videosWithStats['items'])) {
-                    return response()->json($videosWithStats);
-                }
+            if ($ids === '') {
+                return [];
             }
 
-            return response()->json($searchData);
+            $videos = $this->executeRequestWithKeyRotation('videos', [
+                'part' => 'snippet,statistics,contentDetails,liveStreamingDetails',
+                'id'   => $ids,
+            ]);
+
+            return $videos['items'] ?? null;
+        });
+
+        if ($items === null) {
+            return response()->json(['items' => [], 'message' => 'Could not load videos'], 502);
         }
 
-        return response()->json($this->getMockSearchData($query));
+        return response()->json(['items' => $items]);
     }
 
     public function show($id)

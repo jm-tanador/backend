@@ -23,6 +23,8 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
 
 Route::get('/search', [VideoController::class, 'search']);
 Route::get('/videos/{id}', [VideoController::class, 'show']);
+Route::get('/channels/{id}', [VideoController::class, 'channel'])->where('id', 'UC[\w-]{22}');
+Route::get('/channels/{id}/videos', [VideoController::class, 'channelVideos'])->where('id', 'UC[\w-]{22}');
 Route::get('/auth/google', [GoogleAuthController::class, 'redirectToGoogle']);
 Route::get('/auth/google/callback', [GoogleAuthController::class, 'handleGoogleCallback']);
 
